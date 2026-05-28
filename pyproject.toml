@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swij"
+version = "0.1.0"
+description = "AI-native Git & Bitbucket assistant — your terminal teammate."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12.3",
+    "rich>=13.7.1",
+    "google-genai>=1.16.0",
+    "pydantic>=2.7.1",
+    "python-dotenv>=1.0.1",
+]
+
+[project.scripts]
+swij = "swij.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swij"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.7",
+]

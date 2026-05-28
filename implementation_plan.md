@@ -274,7 +274,7 @@ git-ai/                              # Root of the project
 ├── .env.example                     # Template: GEMINI_API_KEY=...
 │
 ├── src/
-│   └── gitai/                       # Core Python package
+│   └── swij/                       # Core Python package
 │       │
 │       ├── __init__.py
 │       ├── main.py                  # CLI entrypoint (Typer app)
@@ -319,7 +319,7 @@ git-ai/                              # Root of the project
 ```
 
 **Why this structure?**
-- `src/gitai/` layout is the industry standard for distributable Python packages. You can later run `pip install git-ai` with this.
+- `src/swij/` layout is the industry standard for distributable Python packages. You can later run `pip install git-ai` with this.
 - `tools/` is organized by domain, not by function. Easy to navigate, easy to add new commands.
 - `schemas/` are separate so both the parser and the engine can import them without circular imports.
 - `tests/` are first-class citizens — not an afterthought.
@@ -329,7 +329,7 @@ git-ai/                              # Root of the project
 ## 8. The Complete Pydantic Schema (Phase 1)
 
 ```python
-# src/gitai/schemas/actions.py  (Conceptual — for review, not final code)
+# src/swij/schemas/actions.py  (Conceptual — for review, not final code)
 
 from pydantic import BaseModel, Field
 from typing import Optional, Literal, List
