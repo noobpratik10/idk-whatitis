@@ -2,7 +2,7 @@
 
 > Your AI-native terminal teammate for Git & Bitbucket.
 
-**swij** (named after Swati + Jitendra) is a terminal-first AI agent that eliminates workflow friction — no more memorizing git commands, copy-pasting errors into ChatGPT, or switching to browser UIs.
+**swij** is a terminal-first AI agent that eliminates workflow friction — no more memorizing git commands, copy-pasting errors into ChatGPT, or switching to browser UIs.
 
 ## Usage
 
