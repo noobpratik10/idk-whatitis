@@ -17,6 +17,14 @@ class CreateBranchTool(GitTool):
     risk_level = "yellow"
     description = "Create a new branch, optionally from a base branch"
     pre_checks = []  # Pre-checks are handled by PreCheckEngine
+    llm_description = (
+        "Create a new git branch, optionally from a specified base branch. "
+        "Requires user confirmation before executing."
+    )
+    llm_parameters = {
+        "branch_name": {"type": "string", "description": "Name of the new branch to create."},
+        "base_branch": {"type": "string", "description": "Branch to create from. Defaults to current HEAD."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         branch_name = plan.branch_name
@@ -59,6 +67,12 @@ class CheckoutBranchTool(GitTool):
     risk_level = "yellow"
     description = "Switch to an existing branch"
     pre_checks = []
+    llm_description = (
+        "Switch to an existing git branch. Requires user confirmation before executing."
+    )
+    llm_parameters = {
+        "branch_name": {"type": "string", "description": "Name of the branch to check out."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         branch_name = plan.branch_name
@@ -74,6 +88,14 @@ class DeleteBranchTool(GitTool):
     risk_level = "red"
     description = "Delete a local branch (requires explicit confirmation)"
     pre_checks = []
+    llm_description = (
+        "Delete a local git branch. This is a destructive action and ALWAYS requires "
+        "explicit user confirmation before executing."
+    )
+    llm_parameters = {
+        "branch_name": {"type": "string", "description": "Name of the branch to delete."},
+        "force": {"type": "boolean", "description": "If true, use -D (force delete) instead of -d."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         branch_name = plan.branch_name

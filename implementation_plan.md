@@ -407,3 +407,312 @@ This is more important than it sounds — it determines how the tool is installe
 ---
 
 Once you answer these four questions, the design is locked. We start coding.
+
+---
+
+## 10. Phase 2: True Agentic Loop — ReAct Architecture
+
+> This section defines the architectural upgrade from the current **linear single-pass pipeline** to a **proper tool-calling agent loop** (the industry standard). This is what will allow swij to answer questions like *"suggest a commit message"*, *"why is my push failing?"*, and *"what changed in the last 5 commits that touched auth files?"*
+
+---
+
+### 10.1 Why the Current Architecture Cannot Do This
+
+The current pipeline in `agent.py` is a straight line:
+
+```
+User Input → IntentParser → PreCheckEngine → ExecutionEngine → ResponseSynthesizer → Output
+              (decides ONCE)                  (runs ONE command)
+```
+
+**The core flaw:** The `IntentParser` must classify the request into a pre-known action *before* gathering any context. If the request does not map to a known git verb (e.g., *"suggest a commit message"*), it returns `action: "unknown"` and the pipeline terminates immediately — before any git command is ever run. The `ResponseSynthesizer` never gets a chance to help because it only runs *after* a successful execution.
+
+**The result:** The tool can only do things in its fixed vocabulary list. Anything that requires "think first, then decide what to run" is impossible.
+
+---
+
+### 10.2 The Industry Standard: ReAct + Native Tool Calling
+
+The industry-standard solution is called **ReAct (Reason + Act)**. It is the pattern used internally by:
+- **Claude Code** (Anthropic)
+- **Cursor** (AI code editor)
+- **OpenHands** (open-source AI dev agent)
+- **GitHub Copilot Workspace**
+
+The idea: instead of the LLM deciding everything upfront, you give it a **loop** where it can call tools on demand to gather context before responding.
+
+```
+User Input
+    │
+    ▼
+┌──────────────────────────────────────────────────────┐
+│                    AGENT LOOP                        │
+│                                                      │
+│  1. Think: "What do I need to answer this?"          │
+│       │                                              │
+│  2. Act: Call a tool (git_diff, git_log, git_status) │
+│       │                                              │
+│  3. Observe: Read tool output                        │
+│       │                                              │
+│  4. "Do I have enough?" ──No──► (back to Step 1)     │
+│       │ Yes                                          │
+└───────┼──────────────────────────────────────────────┘
+        │
+        ▼
+   Synthesize Final Response → Output to user
+```
+
+**For the commit message example**, the agent loop does:
+1. Think: *"User wants a commit message. I need to see the changes."*
+2. Act: Call `git_diff` tool.
+3. Observe: Gets the full diff.
+4. Think: *"Now I have the context. I can write the message."*
+5. Respond: Returns a well-crafted, context-aware commit message.
+
+Zero hallucination. Zero made-up data. The model only responds based on real git output it actually ran.
+
+---
+
+### 10.3 How We Implement This in swij (Gemini Native Function Calling)
+
+Gemini's API has **native function calling / tool use** built in. This is the right implementation path — we define our git commands as `FunctionDeclaration` objects, and Gemini decides when to call them and chains them automatically.
+
+**High-level flow change:**
+
+```python
+# CURRENT (linear):
+plan  = intent_parser.parse(user_input)      # LLM call 1 — classifies
+obs   = execution_engine.execute(plan, cwd)  # runs one subprocess
+resp  = synthesizer.synthesize(obs)          # LLM call 2 — formats output
+
+# PROPOSED (agentic loop):
+agent_loop.run(user_input, cwd)
+# ↳ Internally: LLM decides which tools to call → tools run → LLM reads
+#   output → LLM decides to call more tools OR respond → final output
+```
+
+**What changes structurally:**
+
+| Component | Current Role | After ReAct |
+|---|---|---|
+| `IntentParser` | Classify intent into fixed schema | **Removed** — LLM decides tool calls natively |
+| `ExecutionEngine` | Route JSON plan → subprocess | **Becomes a tool executor** — runs whichever function the LLM requests |
+| `ResponseSynthesizer` | Second LLM call for formatting | **Merged into the agent loop** — the loop's final response IS the synthesized output |
+| `agent.py` | Orchestrate the linear steps | **Becomes the ReAct loop driver** |
+
+**The Tool Definitions (new concept):**
+
+Each git command becomes a `FunctionDeclaration` that the LLM can request:
+
+```python
+# Conceptual — not final code
+
+from google.genai import types
+
+SWIJ_TOOLS = [
+    types.FunctionDeclaration(
+        name="git_status",
+        description="Get the current status of the git repository. Shows staged, unstaged, and untracked files.",
+        parameters={},  # no params needed
+    ),
+    types.FunctionDeclaration(
+        name="git_diff",
+        description="Show the diff of uncommitted changes. Use this to understand what was changed before writing a commit message.",
+        parameters={
+            "staged": {"type": "boolean", "description": "If true, show staged changes. If false, show unstaged."},
+            "file_path": {"type": "string", "description": "Optional specific file path to diff."},
+        },
+    ),
+    types.FunctionDeclaration(
+        name="git_log",
+        description="Show recent commit history.",
+        parameters={
+            "count": {"type": "integer", "description": "Number of commits to show. Default 10."},
+        },
+    ),
+    types.FunctionDeclaration(
+        name="git_commit",
+        description="Stage all changes and commit with a message. ALWAYS ask for confirmation before running this.",
+        parameters={
+            "message": {"type": "string", "description": "The commit message."},
+            "files": {"type": "array", "description": "Specific files to stage. Empty means all."},
+        },
+    ),
+    # ... all other git tools
+]
+```
+
+The LLM sends back a `function_call` response, we run the subprocess, return the output, and the loop continues.
+
+---
+
+### 10.4 Hallucination Prevention — The Most Important Problem
+
+> This is the core challenge. An LLM that can call tools freely could:
+> - Invent git commands that don't exist
+> - Make up file paths or branch names
+> - Run the wrong command and enter an infinite retry loop
+> - Never stop calling tools and run forever
+
+Here is the multi-layer defense system:
+
+#### Layer 1: Closed Tool Vocabulary (The Most Important Guard)
+
+**The LLM can ONLY call functions we explicitly define.** It cannot invent a tool called `git_deploy` or `run_script`. The Gemini API enforces this at the API level — if the model tries to call a function not in our `SWIJ_TOOLS` list, the API rejects it. This alone eliminates 90% of hallucination risk.
+
+```python
+# The model is FORCED to pick from our list. No free-form shell access.
+response = client.models.generate_content(
+    model=model_name,
+    contents=conversation_history,
+    config=types.GenerateContentConfig(
+        tools=SWIJ_TOOLS,
+        tool_choice="auto",  # LLM decides when to call tools
+        system_instruction=AGENT_SYSTEM_PROMPT,
+    )
+)
+```
+
+#### Layer 2: Hard Turn Limit (Anti-Infinite-Loop Guard)
+
+The loop **must have a maximum number of iterations**. If the agent hasn't produced a final answer after N tool calls, it terminates and tells the user.
+
+```python
+MAX_TOOL_CALLS = 8  # Tunable constant
+
+for turn in range(MAX_TOOL_CALLS):
+    response = call_llm(conversation_history)
+    if response.is_final_text:   # model returned text, not a tool call
+        break
+    tool_result = run_tool(response.function_call)
+    conversation_history.append(tool_result)
+else:
+    # Exceeded max turns — tell the user and stop
+    renderer.print_error("I needed too many steps to answer this. Please rephrase.")
+```
+
+This makes it **impossible** for the loop to run forever.
+
+#### Layer 3: Destructive Action Guard (Confirmation Required)
+
+The system prompt explicitly instructs the LLM that any tool marked as destructive (`git_reset`, `git_merge`, `git_rebase`, `git_cherry_pick`) **must not be called** until the user has explicitly confirmed. The tool definitions themselves also include a `requires_confirmation: true` metadata field.
+
+Before executing any destructive function call from the LLM, our loop checks this flag and stops to ask the user — exactly like the current `pre_check_engine` does.
+
+#### Layer 4: Grounded System Prompt (Anti-Scope-Creep Guard)
+
+The agent system prompt is strict and explicit:
+
+```
+You are swij, an AI git assistant. You can ONLY help with git and Bitbucket tasks.
+You have access to a set of git tools. Use them to gather the information you need
+before responding.
+
+Rules:
+- NEVER make up branch names, file names, or commit SHAs. Only use names you have
+  seen in actual tool output.
+- NEVER call a tool more than twice with the same parameters. If a command fails
+  twice, explain the failure and stop.
+- NEVER call destructive tools without explicit user confirmation in your response.
+- If you cannot answer using only git tools, say so clearly.
+- When you have enough information, respond in plain English. Do not keep calling tools.
+```
+
+This prompt acts as the LLM's "conscience" — it explicitly forbids the most common hallucination patterns.
+
+#### Layer 5: Observation Validation (Anti-Bad-Data Guard)
+
+Every tool call result is validated before being fed back to the LLM:
+- Non-zero exit codes are flagged as failures with the stderr message.
+- Timeouts are caught and surfaced as tool errors.
+- Empty output is explicitly labeled as `"(no output)"` — not an empty string, which the LLM might try to re-run.
+
+This ensures the LLM always receives structured, honest observations, not ambiguous empty responses it might misinterpret.
+
+#### Summary: The 5-Layer Hallucination Shield
+
+| Layer | Mechanism | Guards Against |
+|---|---|---|
+| 1 | Closed tool vocabulary | LLM inventing commands |
+| 2 | Hard turn limit (MAX=8) | Infinite loops |
+| 3 | Destructive action confirmation gate | Unsafe auto-execution |
+| 4 | Strict system prompt rules | Scope creep, making up names |
+| 5 | Observation validation | Bad/empty data misinterpretation |
+
+---
+
+### 10.5 Migration Plan: Current Code → ReAct Loop
+
+We do **not** throw away the current code. We migrate incrementally:
+
+**Step 1:** Keep the current linear pipeline working as-is (fallback).
+
+**Step 2:** Add a new `ReactAgent` class alongside the existing `Agent`. Route only "advisory" requests (ones that return `unknown`) to the new ReAct loop first.
+
+**Step 3:** Once ReAct is stable, make it the default for all requests and retire the `IntentParser` + `ExecutionEngine` as separate classes (their logic moves into tool definitions).
+
+**Files that change:**
+- `core/agent.py` — Add `ReactAgent` class with the loop
+- `core/tools/` — New folder. Each git tool becomes a `FunctionDeclaration` + a Python function that runs the subprocess
+- `core/intent_parser.py` — Eventually deprecated; the LLM decides natively
+- `core/execution_engine.py` — Logic moves into individual tool functions
+
+**Files that stay the same:**
+- `ui/renderer.py` — No change
+- `config/settings.py` — No change
+- `schemas/actions.py` — Can be kept for internal type hints
+
+---
+
+### 10.6 Final Decisions (Locked)
+
+All open questions are answered. Locked decisions:
+
+| Question | Decision |
+|---|---|
+| `MAX_TOOL_CALLS` | Configurable via `SWIJ_MAX_TOOL_CALLS` env var (default: 8) — added to `settings.py` alongside existing vars |
+| Simple vs complex requests | `IntentParser` stays for simple known actions. Only `unknown` intents are escalated to the ReAct loop. No redundant loops for simple commands. |
+| New classes vs. modifying agent | **Modify `agent.py` directly** — add the ReAct path inside the existing `Agent` class. No new classes. |
+| Retiring old classes | Nothing retired. `IntentParser`, `ExecutionEngine`, `PreCheckEngine`, `ResponseSynthesizer` all stay. The ReAct loop uses the existing tool classes from `TOOL_REGISTRY` for execution. |
+| Read vs. write tool access | **Read tools (green) run freely.** Write/destructive tools always pause and ask for confirmation before executing. |
+| Memory across invocations | **No cross-invocation memory** for now. Each `swij "..."` call is stateless. |
+| Turn limit exceeded | Tell the user: *"This request needed too many steps. Please break it down."* |
+| Tool call verbosity | **Dynamic spinner**: update spinner text to show the current tool being called (e.g. `→ running git diff…`). No separate step list. |
+
+---
+
+### 10.7 Precise Execution Plan
+
+> [!IMPORTANT]
+> This is the exact set of file changes to implement. Minimal edits, no bloat, no unnecessary rewrites.
+
+#### File 1: `config/settings.py` — ADD one accessor
+Add `get_max_tool_calls()` reading `SWIJ_MAX_TOOL_CALLS` env var (default `8`).
+
+#### File 2: `core/agent.py` — MODIFY the `_process` method
+When `plan.action == "unknown"`, instead of showing a clarification panel, route into the new **ReAct path** inside the same `Agent` class:
+```
+_react_loop(user_input, cwd)  # new private method on Agent
+```
+All other actions keep the existing linear pipeline exactly as-is.
+
+The `_react_loop` method:
+1. Builds `FunctionDeclaration` objects from the existing `TOOL_REGISTRY` (read-only tools only, at first).
+2. Runs the Gemini `generate_content` call in a `for turn in range(max_tool_calls)` loop.
+3. On each `function_call` response: update spinner text → run the tool via `TOOL_REGISTRY` → append result to conversation history.
+4. On `function_call` for write tools: pause → ask user to confirm → run or cancel.
+5. On `text` response: break → render the final answer via `renderer.print_response`.
+6. On loop exhaustion: `renderer.print_clarification_request("This needed too many steps…")`.
+
+#### File 3: `core/response_synthesizer.py` — NO CHANGE
+Used only by the existing linear path. The ReAct loop's final LLM text response is rendered directly.
+
+#### File 4: `tools/base.py` — ADD two class attributes to `GitTool`
+Add `llm_description: str` and `llm_parameters: dict` class attributes. These provide the text for `FunctionDeclaration` so the tool self-describes to the LLM, staying consistent with the Tool Registry Pattern.
+
+#### File 5: Each tool file — ADD the two new attributes
+`inspection_tools.py`, `branch_tools.py`, `commit_tools.py`, `remote_tools.py`, `destructive_tools.py` — each tool class gets `llm_description` and `llm_parameters` filled in.
+
+#### Nothing else changes.
+`pre_check_engine.py`, `observation.py`, `schemas/actions.py`, `ui/renderer.py`, `main.py`, `config/settings.py` (except the one accessor) — all untouched.
+

@@ -63,6 +63,11 @@ class GitTool(ABC):
     description: str
     pre_checks: list[PreCheckFn] = []
 
+    # Used by the ReAct loop to build Gemini FunctionDeclarations.
+    # Each subclass should override these if it participates in the loop.
+    llm_description: str = ""   # What the LLM-facing description of this tool is
+    llm_parameters: dict = {}   # JSON-schema-style dict of parameters, empty if none
+
     # ── Subprocess helper ─────────────────────────────────────────────────
 
     @staticmethod
@@ -168,6 +173,41 @@ class _ToolRegistry:
                 }
             )
         return rows
+
+    def function_declarations(
+        self, risk_levels: tuple[str, ...] = ("green", "yellow", "red")
+    ) -> list:
+        """
+        Build a list of google.genai FunctionDeclaration objects for all
+        registered tools whose risk_level is in `risk_levels`.
+
+        Used by the ReAct loop to expose tools to the Gemini model.
+        Import is deferred so that tools without google-genai still work.
+        """
+        from google.genai import types
+
+        declarations = []
+        for name, cls in self._tools.items():
+            if cls.risk_level not in risk_levels:
+                continue
+            if not cls.llm_description:
+                continue  # opt-in: only expose tools that have descriptions set
+
+            params_schema: dict = {}
+            if cls.llm_parameters:
+                params_schema = {
+                    "type": "object",
+                    "properties": cls.llm_parameters,
+                }
+
+            declarations.append(
+                types.FunctionDeclaration(
+                    name=name,
+                    description=cls.llm_description,
+                    parameters=params_schema or None,
+                )
+            )
+        return declarations
 
 
 TOOL_REGISTRY = _ToolRegistry()

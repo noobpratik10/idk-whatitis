@@ -3,13 +3,22 @@ core/agent.py
 =============
 The main agentic loop that orchestrates all layers of swij.
 
-Data flow (happy path):
+Data flow — known actions (happy path):
   User input
     → IntentParser    (English → GitActionPlan)
     → PreCheckEngine  (pre-flight validation)
     → Confirmation    (if red-level or advisory)
     → ExecutionEngine (GitActionPlan → subprocess)
     → ResponseSynthesizer (raw output → natural language)
+    → Renderer        (display to user)
+
+Data flow — open-ended questions (ReAct path):
+  User input
+    → IntentParser    (returns action='unknown')
+    → ReactLoop       (Gemini native function calling)
+        → tool calls resolved via TOOL_REGISTRY
+        → confirmation gate for yellow/red tools
+        → final text response rendered directly
     → Renderer        (display to user)
 
 Ctrl+C handling:
@@ -24,7 +33,15 @@ import os
 import subprocess
 from typing import Optional
 
-from swij.config.settings import get_confidence_threshold
+from google import genai
+from google.genai import types
+
+from swij.config.settings import (
+    get_confidence_threshold,
+    get_gemini_api_key,
+    get_gemini_model,
+    get_max_tool_calls,
+)
 from swij.core.execution_engine import ExecutionEngine
 from swij.core.intent_parser import IntentParser
 from swij.core.observation import MultiObservation, Observation
@@ -32,6 +49,29 @@ from swij.core.pre_check_engine import PreCheckEngine
 from swij.core.response_synthesizer import ResponseSynthesizer
 from swij.schemas.actions import GitActionPlan
 from swij.ui import renderer
+
+# ---------------------------------------------------------------------------
+# ReAct agent system prompt
+# ---------------------------------------------------------------------------
+
+_REACT_SYSTEM_PROMPT = """\
+You are swij, an AI git assistant running in the user's terminal.
+You have access to a set of git tools. Use them to gather information and take actions.
+
+## Rules — follow these strictly
+
+1. ONLY use the tools provided. Never invent tool names.
+2. NEVER make up branch names, file names, or commit SHAs. Only use values you have
+   seen in actual tool output.
+3. NEVER call a tool more than twice with identical parameters. If a tool fails twice,
+   stop and explain the failure clearly.
+4. Before calling any write or destructive tool (non-read operations), you MUST first
+   tell the user what you are about to do and why. The system will ask for confirmation.
+5. When you have enough information to answer, respond in plain English using markdown.
+   Do not keep calling tools once you can answer.
+6. If you cannot help with something using only git tools, say so directly.
+7. Be concise. Developers are busy.
+"""
 
 
 class Agent:
@@ -50,6 +90,9 @@ class Agent:
         self._engine = ExecutionEngine()
         self._synthesizer = ResponseSynthesizer()
         self._confidence_threshold = get_confidence_threshold()
+        self._max_tool_calls = get_max_tool_calls()
+        self._gemini_client = genai.Client(api_key=get_gemini_api_key())
+        self._model_name = get_gemini_model()
 
     def run(self, user_input: str) -> None:
         """
@@ -75,13 +118,9 @@ class Agent:
             repo_context = self._get_repo_context(cwd)
             plan = self._parser.parse(user_input, context=repo_context)
 
-        # ── Step 2: Handle unknown intent ─────────────────────────────────
+        # ── Step 2: Handle unknown intent → escalate to ReAct loop ────────
         if plan.action == "unknown":
-            message = plan.user_message or (
-                "I couldn't understand that request. "
-                "Try something like 'show git status' or 'create a branch'."
-            )
-            renderer.print_clarification_request(message)
+            self._react_loop(user_input, cwd)
             return
 
         # ── Step 3: Handle low confidence ─────────────────────────────────
@@ -158,6 +197,187 @@ class Agent:
             response = self._synthesizer.synthesize(plan, observation, user_input)
 
         renderer.print_response(response, action=plan.action)
+
+    # ── ReAct loop ─────────────────────────────────────────────────────────
+
+    def _react_loop(self, user_input: str, cwd: str) -> None:
+        """
+        ReAct (Reason + Act) agent loop using Gemini native function calling.
+
+        Triggered when IntentParser cannot map the request to a known git action.
+        Gives Gemini access to all registered tools and lets it call them as needed
+        to gather context and produce a final natural-language answer.
+
+        Safety guarantees:
+        - Closed tool vocabulary: only TOOL_REGISTRY tools are exposed
+        - Hard turn limit: loop stops after MAX_TOOL_CALLS iterations
+        - Confirmation gate: yellow/red tools always ask the user before running
+        - Grounded system prompt: anti-hallucination rules baked in
+        """
+        from swij.tools.base import TOOL_REGISTRY
+
+        tool_declarations = TOOL_REGISTRY.function_declarations()
+        if not tool_declarations:
+            renderer.print_clarification_request(
+                "I couldn't understand that request. "
+                "Try something like 'show git status' or 'create a branch'."
+            )
+            return
+
+        gemini_tools = [types.Tool(function_declarations=tool_declarations)]
+
+        # Seed conversation history with the user's message
+        conversation: list = [
+            types.Content(role="user", parts=[types.Part(text=user_input)]),
+        ]
+
+        try:
+            with renderer.thinking("Thinking…") as status:
+                for _turn in range(self._max_tool_calls):
+                    response = self._gemini_client.models.generate_content(
+                        model=self._model_name,
+                        contents=conversation,
+                        config=types.GenerateContentConfig(
+                            system_instruction=_REACT_SYSTEM_PROMPT,
+                            tools=gemini_tools,
+                            temperature=0.3,
+                        ),
+                    )
+
+                    candidate = response.candidates[0] if response.candidates else None
+                    if candidate is None:
+                        break
+
+                    parts = candidate.content.parts or []
+                    function_calls = [p.function_call for p in parts if getattr(p, "function_call", None)]
+                    text_parts = [p.text for p in parts if getattr(p, "text", None)]
+
+                    if not function_calls:
+                        # Model returned a final text answer — render and exit
+                        final_text = "\n".join(text_parts).strip()
+                        if final_text:
+                            renderer.print_response(final_text)
+                        return
+
+                    # Model wants to call tools — process each call
+                    tool_response_parts = []
+                    for fc in function_calls:
+                        tool_name = fc.name
+                        tool_args = dict(fc.args) if fc.args else {}
+
+                        # Update spinner to show which tool is being called
+                        status.update(
+                            f"[swij.info]→ running {tool_name}…[/swij.info]"
+                        )
+
+                        tool_cls = TOOL_REGISTRY.get(tool_name)
+                        if tool_cls is None:
+                            result_text = f"Error: tool '{tool_name}' is not registered."
+                        else:
+                            risk = tool_cls.risk_level
+
+                            # Confirmation gate for write/destructive tools
+                            if risk in ("yellow", "red"):
+                                confirmed = renderer.confirm_destructive(
+                                    action=tool_name,
+                                    details=(
+                                        f"The assistant wants to run **{tool_name}**"
+                                        + (f" with: `{tool_args}`" if tool_args else "")
+                                    ),
+                                )
+                                if not confirmed:
+                                    result_text = (
+                                        "User declined this action. Do not retry it."
+                                    )
+                                    tool_response_parts.append(
+                                        types.Part(
+                                            function_response=types.FunctionResponse(
+                                                name=tool_name,
+                                                response={"output": result_text},
+                                            )
+                                        )
+                                    )
+                                    continue
+
+                            obs = self._run_tool_from_args(
+                                tool_cls, tool_name, tool_args, cwd
+                            )
+                            result_text = (
+                                obs.stdout if obs.success
+                                else f"FAILED (exit {obs.returncode}): {obs.stderr}"
+                            )
+                            if not result_text:
+                                result_text = "(no output)"
+
+                        tool_response_parts.append(
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    name=tool_name,
+                                    response={"output": result_text},
+                                )
+                            )
+                        )
+
+                    # Append model turn + all tool responses to conversation
+                    conversation.append(candidate.content)
+                    conversation.append(
+                        types.Content(role="user", parts=tool_response_parts)
+                    )
+
+                else:
+                    # Loop exhausted without final text response
+                    renderer.print_clarification_request(
+                        "This request needed too many steps to answer. "
+                        "Please try breaking it into smaller, more specific questions."
+                    )
+
+        except KeyboardInterrupt:
+            renderer.print_interrupted(completed_steps=[])
+
+    def _run_tool_from_args(
+        self,
+        tool_cls: type,
+        tool_name: str,
+        args: dict,
+        cwd: str,
+    ) -> Observation:
+        """
+        Construct a minimal GitActionPlan from the LLM's function call args
+        and execute the tool. Maps common arg names to GitActionPlan fields.
+        """
+        plan_kwargs: dict = {"action": tool_name}  # type: ignore[assignment]
+
+        # Map common LLM-supplied argument names to GitActionPlan fields
+        field_map = {
+            "branch_name": "branch_name",
+            "base_branch": "base_branch",
+            "message":     "commit_message",
+            "commit":      "reset_target",
+            "target":      "reset_target",
+            "mode":        "reset_mode",
+            "files":       "files_to_add",
+            "url":         "remote_url",
+            "directory":   "target_directory",
+            "remote":      "remote_name",
+            "branch":      "branch_name",
+            "force":       "force",
+            "staged":      "diff_staged",
+            "file_path":   "diff_target",
+            "count":       "log_count",
+        }
+        for arg_key, plan_field in field_map.items():
+            if arg_key in args:
+                plan_kwargs[plan_field] = args[arg_key]
+
+        # files_to_add must be a list, not a comma-string
+        if "files_to_add" in plan_kwargs and isinstance(plan_kwargs["files_to_add"], str):
+            plan_kwargs["files_to_add"] = [
+                f.strip() for f in plan_kwargs["files_to_add"].split(",") if f.strip()
+            ]
+
+        plan = GitActionPlan(**plan_kwargs)
+        tool = tool_cls()
+        return tool.execute(plan, cwd)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

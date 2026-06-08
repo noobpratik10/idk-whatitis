@@ -79,7 +79,7 @@ def main(
     from swij.core.agent import Agent
     from swij.ui.renderer import print_brand
 
-    print_brand()
+    # print_brand()
 
     agent = Agent()
     agent.run(request.strip())

@@ -95,3 +95,8 @@ def get_subprocess_timeout() -> int:
 def get_confidence_threshold() -> float:
     """Intent confidence below this threshold triggers a clarification ask."""
     return float(os.getenv("SWIJ_CONFIDENCE_THRESHOLD", "0.75"))
+
+
+def get_max_tool_calls() -> int:
+    """Maximum number of tool-call iterations in the ReAct agent loop."""
+    return int(os.getenv("SWIJ_MAX_TOOL_CALLS", "8"))

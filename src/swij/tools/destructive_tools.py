@@ -21,6 +21,14 @@ class GitResetTool(GitTool):
     risk_level = "red"
     description = "Reset HEAD to a previous commit (soft/mixed/hard — requires confirmation)"
     pre_checks = []
+    llm_description = (
+        "Reset HEAD to a previous commit. DESTRUCTIVE — ALWAYS requires explicit user confirmation. "
+        "Mode: soft (keep staged), mixed (unstage), hard (discard all changes)."
+    )
+    llm_parameters = {
+        "mode": {"type": "string", "description": "Reset mode: 'soft', 'mixed', or 'hard'."},
+        "target": {"type": "string", "description": "Commit ref to reset to, e.g. 'HEAD~1' or a SHA."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         mode = plan.reset_mode or "mixed"
@@ -34,6 +42,13 @@ class GitRestoreTool(GitTool):
     risk_level = "red"
     description = "Restore working tree files (discard changes — requires confirmation)"
     pre_checks = []
+    llm_description = (
+        "Discard local file changes, restoring them to the last committed state. "
+        "DESTRUCTIVE — ALWAYS requires explicit user confirmation."
+    )
+    llm_parameters = {
+        "files": {"type": "string", "description": "Comma-separated file paths to restore. Leave empty to restore all."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         if plan.files_to_add:
@@ -51,6 +66,13 @@ class GitMergeTool(GitTool):
     risk_level = "red"
     description = "Merge a branch into the current branch (requires confirmation)"
     pre_checks = []
+    llm_description = (
+        "Merge a branch into the current branch. "
+        "DESTRUCTIVE — ALWAYS requires explicit user confirmation."
+    )
+    llm_parameters = {
+        "branch_name": {"type": "string", "description": "Name of the branch to merge in."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         branch_name = plan.branch_name
@@ -65,6 +87,13 @@ class GitRebaseTool(GitTool):
     risk_level = "red"
     description = "Rebase current branch onto another (requires confirmation)"
     pre_checks = []
+    llm_description = (
+        "Rebase the current branch onto another branch. "
+        "DESTRUCTIVE — ALWAYS requires explicit user confirmation."
+    )
+    llm_parameters = {
+        "branch_name": {"type": "string", "description": "Branch to rebase onto."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         branch_name = plan.base_branch or plan.branch_name
@@ -79,6 +108,13 @@ class GitCherryPickTool(GitTool):
     risk_level = "red"
     description = "Apply a specific commit onto the current branch (requires confirmation)"
     pre_checks = []
+    llm_description = (
+        "Apply a specific commit from another branch onto the current branch. "
+        "DESTRUCTIVE — ALWAYS requires explicit user confirmation."
+    )
+    llm_parameters = {
+        "commit": {"type": "string", "description": "Commit SHA or ref to cherry-pick."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         target = plan.reset_target  # reuse the ref field

@@ -17,6 +17,13 @@ class GitAddTool(GitTool):
     risk_level = "yellow"
     description = "Stage files for commit (specific files or all changes)"
     pre_checks = []
+    llm_description = (
+        "Stage files for commit. Stages all changes if no files specified. "
+        "Requires user confirmation before executing."
+    )
+    llm_parameters = {
+        "files": {"type": "string", "description": "Comma-separated file paths to stage. Leave empty to stage all changes."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         if plan.files_to_add:
@@ -32,6 +39,14 @@ class GitCommitTool(GitTool):
     risk_level = "yellow"
     description = "Commit staged changes with a message"
     pre_checks = []
+    llm_description = (
+        "Commit currently staged changes with a commit message. "
+        "ALWAYS requires user confirmation before executing. "
+        "Run git_diff with staged=true first to see what will be committed."
+    )
+    llm_parameters = {
+        "message": {"type": "string", "description": "The commit message to use."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         message = plan.commit_message
@@ -48,6 +63,13 @@ class GitStashTool(GitTool):
     risk_level = "yellow"
     description = "Stash current working tree changes"
     pre_checks = []
+    llm_description = (
+        "Save current uncommitted changes to the stash for later. "
+        "Requires user confirmation before executing."
+    )
+    llm_parameters = {
+        "message": {"type": "string", "description": "Optional label for the stash entry."},
+    }
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         args = ["git", "stash", "push"]
@@ -62,6 +84,11 @@ class GitStashPopTool(GitTool):
     risk_level = "yellow"
     description = "Apply the most recent stash and remove it from the stash list"
     pre_checks = []
+    llm_description = (
+        "Apply the most recently stashed changes and remove them from the stash list. "
+        "Requires user confirmation before executing."
+    )
+    llm_parameters = {}
 
     def execute(self, plan: GitActionPlan, cwd: str) -> Observation:
         return self.run(["git", "stash", "pop"], cwd=cwd)
